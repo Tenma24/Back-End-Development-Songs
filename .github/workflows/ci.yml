@@ -1,0 +1,27 @@
+name: Test and build
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      mongodb:
+        image: mongo:8.0
+        ports: ['27017:27017']
+    env:
+      MONGODB_SERVICE: localhost:27017
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - name: Run tests
+        run: python -m pytest -v
+      - name: Build Docker image
+        run: docker build --progress=plain -t capstone-app:ci . 2>&1 | tee docker-build.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-build-output
+          path: docker-build.log

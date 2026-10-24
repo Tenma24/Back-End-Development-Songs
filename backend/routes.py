@@ -1,53 +1,79 @@
-from . import app
-import os
 import json
-import pymongo
-from flask import jsonify, request, make_response, abort, url_for  # noqa; F401
-from pymongo import MongoClient
+import os
+from pathlib import Path
+from urllib.parse import quote_plus
 from bson import json_util
-from pymongo.errors import OperationFailure
-from pymongo.results import InsertOneResult
-from bson.objectid import ObjectId
-import sys
+from flask import jsonify, request
+from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError, PyMongoError
+from . import app
 
-SITE_ROOT = os.path.realpath(os.path.dirname(__file__))
-json_url = os.path.join(SITE_ROOT, "data", "songs.json")
-songs_list: list = json.load(open(json_url))
+server = os.environ.get('MONGODB_SERVICE', '127.0.0.1:27017')
+username = os.environ.get('MONGODB_USERNAME')
+password = os.environ.get('MONGODB_PASSWORD', '')
+auth = f'{quote_plus(username)}:{quote_plus(password)}@' if username else ''
+client = MongoClient(os.environ.get('MONGODB_URI', f'mongodb://{auth}{server}'), serverSelectionTimeoutMS=5000)
+db = client[os.environ.get('MONGODB_DATABASE', 'capstone_songs')]
+db.songs.create_index('id', unique=True)
+for song in json.loads((Path(__file__).parent / 'data/songs.json').read_text(encoding='utf-8')):
+    db.songs.update_one({'id': song['id']}, {'$setOnInsert': song}, upsert=True)
 
-# client = MongoClient(
-#     f"mongodb://{app.config['MONGO_USERNAME']}:{app.config['MONGO_PASSWORD']}@localhost")
-mongodb_service = os.environ.get('MONGODB_SERVICE')
-mongodb_username = os.environ.get('MONGODB_USERNAME')
-mongodb_password = os.environ.get('MONGODB_PASSWORD')
-mongodb_port = os.environ.get('MONGODB_PORT')
+def parse_json(value):
+    return json.loads(json_util.dumps(value))
 
-print(f'The value of MONGODB_SERVICE is: {mongodb_service}')
+@app.errorhandler(PyMongoError)
+def database_error(error):
+    app.logger.error('MongoDB operation failed: %s', type(error).__name__)
+    return jsonify(message='Database unavailable'), 503
 
-if mongodb_service == None:
-    app.logger.error('Missing MongoDB server in the MONGODB_SERVICE variable')
-    # abort(500, 'Missing MongoDB server in the MONGODB_SERVICE variable')
-    sys.exit(1)
+@app.get('/health')
+def health():
+    client.admin.command('ping')
+    return jsonify(status='OK')
 
-if mongodb_username and mongodb_password:
-    url = f"mongodb://{mongodb_username}:{mongodb_password}@{mongodb_service}"
-else:
-    url = f"mongodb://{mongodb_service}"
+@app.get('/count')
+def count():
+    return jsonify(count=db.songs.count_documents({}))
 
+@app.get('/song')
+def songs():
+    return jsonify(songs=parse_json(list(db.songs.find().sort('id', 1))))
 
-print(f"connecting to url: {url}")
+@app.get('/song/<int:id>')
+def get_song(id):
+    song = db.songs.find_one({'id': id})
+    return (jsonify(parse_json(song)), 200) if song else (jsonify(message=f'song with id {id} not found'), 404)
 
-try:
-    client = MongoClient(url)
-except OperationFailure as e:
-    app.logger.error(f"Authentication error: {str(e)}")
+def valid(data, partial=False):
+    return (isinstance(data, dict) and bool(data) and not (set(data) - {'id', 'title', 'lyrics'})
+            and (partial or type(data.get('id')) is int)
+            and all(isinstance(data.get(k), str) and data[k].strip() for k in ('title', 'lyrics') if not partial or k in data))
 
-db = client.songs
-db.songs.drop()
-db.songs.insert_many(songs_list)
+@app.post('/song')
+def post_song():
+    data = request.get_json(silent=True)
+    if not valid(data):
+        return jsonify(message='Provide integer id and nonempty title and lyrics'), 400
+    try:
+        result = db.songs.insert_one(data)
+    except DuplicateKeyError:
+        return jsonify(Message=f"song with id {data['id']} already present"), 302
+    return jsonify({'inserted id': parse_json(result.inserted_id)}), 201
 
-def parse_json(data):
-    return json.loads(json_util.dumps(data))
+@app.put('/song/<int:id>')
+def put_song(id):
+    if not db.songs.find_one({'id': id}):
+        return jsonify(message='song not found'), 404
+    data = request.get_json(silent=True)
+    if not valid(data, partial=True) or ('id' in data and (type(data['id']) is not int or data['id'] != id)):
+        return jsonify(message='Invalid update'), 400
+    result = db.songs.update_one({'id': id}, {'$set': data})
+    if not result.modified_count:
+        return jsonify(message='song found, but nothing updated'), 200
+    return jsonify(parse_json(db.songs.find_one({'id': id}))), 201
 
-######################################################################
-# INSERT CODE HERE
-######################################################################
+@app.delete('/song/<int:id>')
+def delete_song(id):
+    if db.songs.delete_one({'id': id}).deleted_count:
+        return '', 204
+    return jsonify(message='song not found'), 404
