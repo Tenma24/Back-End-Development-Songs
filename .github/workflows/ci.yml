@@ -20,6 +20,7 @@ jobs:
       - name: Run tests
         run: python -m pytest -v
       - name: Build Docker image
+        shell: bash
         run: docker build --progress=plain -t capstone-app:ci . 2>&1 | tee docker-build.log
       - uses: actions/upload-artifact@v4
         with:
