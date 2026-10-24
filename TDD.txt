@@ -1,0 +1,1 @@
+RED baseline: original IBM health test fails with HTTP 404.
